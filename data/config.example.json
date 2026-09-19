@@ -1,0 +1,12 @@
+{
+  "USE_MQTT": true,
+  "USE_LORA": true,
+  "USE_DUMMY": false,
+  "LORA_MQTT_BROKER": "mqtt.meshtastic.org",
+  "LORA_MQTT_PORT": 1883,
+  "LORA_MQTT_USER": "meshdev",
+  "LORA_CHANNEL": "JPEQ",
+  "EEW_MIN_SCALE": 30,
+  "MIN_SENDO_SCALE": 10,
+  "ENABLE_DISCORD": true
+}
