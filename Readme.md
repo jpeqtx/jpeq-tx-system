@@ -27,6 +27,21 @@ P2PQuake、Wolfx、気象庁の各種API/XMLフィードを受信し、以下の
 - 単一プロセス・マルチスレッド構成
 - Windows / Linux 両対応
 
+## yakitama ロジックについて
+
+本システムの中核ロジックは、**yakitama氏が開発した防災情報処理ロジック）** をベースとしている。
+これらは yakitama氏の設計思想に基づいて実装されており、本システムはそのロジックを尊重し、拡張・改修を加えたものである。オリジナルの設計に対する深い敬意と感謝を表する。
+
+## 翻訳辞書について
+
+本システムの地名・警報名・河川名などの英語変換は、**気象庁が公開する多言語辞書データ**をベースとしている。
+
+- 気象庁 多言語辞書: https://www.data.jma.go.jp/developer/multilingual.html
+
+気象庁の基準辞書に沿いつつ、本システムで扱う情報の範囲（河川名、火山名、観測点名、複合警報名など）において、辞書に未収録の項目を、気象庁の表記規則と齟齬が発生しない範囲で補完している。
+
+辞書データは `data/jpeq_dict.json` に格納されており、GUIの「Dictionary」タブから編集・追加が可能である。
+
 ## 動作要件
 
 - Python 3.10 以上
@@ -111,6 +126,7 @@ JPEQ/
 | Wolfx WebSocket | wss://ws-api.wolfx.jp/jma_eew |
 | 気象庁警報API (R8) | https://www.jma.go.jp/bosai/warning/data/r8/ |
 | 気象庁防災情報XML | https://www.data.jma.go.jp/developer/xml/feed/ |
+| 気象庁 多言語辞書 | https://www.data.jma.go.jp/developer/multilingual.html |
 | Yahoo!防災速報 | https://emergency-weather.yahoo.co.jp/weather/jp/jalert/ |
 | 気象庁VTSE41 | https://www.data.jma.go.jp/multi/data/VTSE41/warning.json |
 
