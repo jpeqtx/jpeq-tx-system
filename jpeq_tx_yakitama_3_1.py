@@ -182,7 +182,7 @@ class Config:
     WS_BACKOFF_INIT     = 3
     WS_BACKOFF_MAX      = 30
 
-    SYSTEM_VERSION      = "JPEQ TX System v0.31 Yakitama Final"
+    SYSTEM_VERSION      = "JPEQ TX System v0.32 Yakitama Final"
     ENABLE_MAP_URL      = True
     EEW_SEND_MODE       = "all"
     EEW_MAP_URL_MODE    = "first"
@@ -553,6 +553,22 @@ _RIVER_FLOOD_CODE_TO_LEVEL: dict[str, int] = {
 }
 
 _RIVER_FLOOD_LEVEL_LABEL = {5: "EMERGENCY", 4: "URGENT", 3: "WARNING", 2: "ADVISORY"}
+
+# ================================================================
+# 気象庁 震度階級 → 内部スケール変換
+# VXSE51（震源・震度に関する情報）の MaxInt 解析に使用
+# ================================================================
+_JMA_INT_TO_SCALE: dict[str, int] = {
+    "1": 10, "2": 20, "3": 30, "4": 40,
+    "5-": 45, "5+": 50, "6-": 55, "6+": 60, "7": 70,
+}
+
+
+def _jma_int_to_scale(int_str: str) -> int:
+    """気象庁震度表記（1,2,3,4,5-,5+,6-,6+,7）を内部スケールへ変換する。"""
+    if not int_str:
+        return 0
+    return _JMA_INT_TO_SCALE.get(int_str.strip(), 0)
 
 def _warning_level(jp_name: str) -> int:
     if not jp_name:
@@ -2074,7 +2090,9 @@ def handle_eq(payload: dict[str, Any], send_fn: Callable[[str], None], state: di
         if felt: send_fn(f"[{eq_prefix}] FELT AREA: {felt}{eew_tag}")
 
         eid = str(payload.get("_id") or payload.get("id") or "")
-        if eid and not store.has_tsunami_for_earthquake(eid):
+        # 津波の有無は気象庁 VXSE52 で確定する。
+        # VXSE52 が「津波の心配はありません」と明示した場合のみ送信する。
+        if eid and payload.get("no_tsunami_threat"):
             send_fn(f"[{eq_prefix}] NO TSUNAMI THREAT")
 
         if eid:
@@ -2393,17 +2411,28 @@ class TxSystem:
             "r8": False,
             "river": False,
             "volcano": False,
+            "earthquake": False,
         }
 
         # 各フィードの最終取得成功時刻と連続失敗回数
         self._feed_last_success: dict[str, float] = {
             "r8": 0.0, "river": 0.0, "volcano": 0.0,
             "typhoon": 0.0, "megaquake": 0.0, "jalert": 0.0,
+            "earthquake": 0.0,
         }
         self._feed_fail_count: dict[str, int] = {
             "r8": 0, "river": 0, "volcano": 0,
             "typhoon": 0, "megaquake": 0, "jalert": 0,
+            "earthquake": 0,
         }
+
+        # VXSE51（震源・震度）と VXSE52（津波）のペアリングバッファ
+        # VXSE52 を最大 30 秒待ち、揃った時点で Final 報を送信する。
+        self._pending_vxse51: dict[str, dict[str, Any]] = {}
+        self._pending_vxse51_timers: dict[str, threading.Timer] = {}
+        self._pending_vxse52: dict[str, str] = {}
+        self._pending_vxse51_lock = threading.Lock()
+        self._vxse51_wait_sec = 30.0
 
         # Monitor 子タブ用 URL 履歴
         self.earthquake_urls: deque = deque(maxlen=100)
@@ -4921,6 +4950,290 @@ class TxSystem:
             self._ui_log("INFO", "Weather summary: no active warnings to send")
 
     # ===================================
+    # Earthquake Feed (VXSE51 / VXSE52)
+    # ===================================
+    def _check_earthquake_feed(self):
+        """
+        extra.xml から VXSE51（震源・震度）と VXSE52（津波）を検出し、
+        Final 報の地震情報を送信する。
+        """
+        try:
+            r = request_with_retry(
+                "GET",
+                config.JMA_FEED_URL,
+                retries=2,
+                backoff=1.0,
+                timeout=(5, 15),
+            )
+            if r is None or r.status_code != 200:
+                if r is not None:
+                    self._ui_log("ERROR", f"Earthquake feed fetch failed: status={r.status_code}")
+                self._feed_fail_count["earthquake"] = self._feed_fail_count.get("earthquake", 0) + 1
+                return
+            root = ET.fromstring(r.content)
+            self._feed_last_success["earthquake"] = time.time()
+            self._feed_fail_count["earthquake"] = 0
+            if not self._feed_info_logged.get("earthquake", False):
+                self._ui_log("INFO", "Earthquake feed fetched successfully")
+                self._feed_info_logged["earthquake"] = True
+        except Exception as e:
+            self._ui_log("ERROR", f"Earthquake feed fetch error: url={config.JMA_FEED_URL} error={e}")
+            self._feed_fail_count["earthquake"] = self._feed_fail_count.get("earthquake", 0) + 1
+            return
+
+        ATOM_NS = "http://www.w3.org/2005/Atom"
+        entries = root.findall(f"{{{ATOM_NS}}}entry")
+
+        def _entry_sort_key(entry):
+            updated_elem = entry.find(f"{{{ATOM_NS}}}updated")
+            if updated_elem is not None and updated_elem.text:
+                try:
+                    return datetime.fromisoformat(updated_elem.text.replace("Z", "+00:00"))
+                except Exception:
+                    pass
+            return datetime.now(timezone.utc) - timedelta(days=1)
+
+        entries.sort(key=_entry_sort_key, reverse=False)
+
+        for entry in entries:
+            eid_elem = entry.find(f"{{{ATOM_NS}}}id")
+            eid = eid_elem.text if eid_elem is not None else ""
+            if not eid:
+                continue
+            if "VXSE51" not in eid and "VXSE52" not in eid:
+                continue
+            if eid in self._processed_weather_ids:
+                continue
+
+            updated_elem = entry.find(f"{{{ATOM_NS}}}updated")
+            if updated_elem is not None and updated_elem.text:
+                try:
+                    entry_time = datetime.fromisoformat(updated_elem.text.replace("Z", "+00:00"))
+                    age_sec = (datetime.now(timezone.utc) - entry_time).total_seconds()
+                    if age_sec >= 86400:
+                        continue
+                except Exception:
+                    pass
+
+            link = entry.find(f"{{{ATOM_NS}}}link")
+            href = link.get("href") if link is not None else ""
+            if not href:
+                continue
+
+            try:
+                detail_root = self._fetch_and_parse_xml(href)
+            except Exception as e:
+                self._ui_log("ERROR", f"Earthquake feed: failed to fetch detail for {eid}: {e}")
+                continue
+
+            if "VXSE51" in eid:
+                self._handle_vxse51(detail_root, eid)
+            elif "VXSE52" in eid:
+                self._handle_vxse52(detail_root, eid)
+
+            self._processed_weather_ids[eid] = time.time()
+            if len(self._processed_weather_ids) > config.PROCESSED_WEATHER_IDS_MAX:
+                oldest_keys = sorted(self._processed_weather_ids, key=lambda k: self._processed_weather_ids[k])[:len(self._processed_weather_ids) - config.PROCESSED_WEATHER_IDS_MAX]
+                for k in oldest_keys:
+                    self._processed_weather_ids.pop(k, None)
+
+    def _extract_event_id(self, detail_root) -> str:
+        """Head/EventID を取得する。VXSE51 と VXSE52 の紐付けに使用。"""
+        head = self._find_local_first(detail_root, 'Head')
+        if head is None:
+            return ""
+        eid_elem = self._find_local_first(head, 'EventID')
+        if eid_elem is not None and eid_elem.text:
+            return eid_elem.text.strip()
+        return ""
+
+    def _parse_vxse51_to_payload(self, detail_root, eid: str) -> dict[str, Any] | None:
+        """
+        VXSE51（震源・震度に関する情報）を JPEQ 内部の payload 形式へ変換する。
+        既存の handle_eq と互換性を持たせる。
+        """
+        payload: dict[str, Any] = {
+            "code": 551,
+            "_id": eid,
+            "_jma_event_id": self._extract_event_id(detail_root),
+            "earthquake": {
+                "time": "",
+                "hypocenter": {
+                    "name": "",
+                    "latitude": "",
+                    "longitude": "",
+                    "depth": "",
+                    "magnitude": "",
+                },
+                "maxScale": 0,
+            },
+            "points": [],
+        }
+
+        eq_elem = self._find_local_first(detail_root, "Earthquake")
+        if eq_elem is None:
+            self._ui_log("WARN", f"VXSE51: Earthquake element not found ({eid})")
+            return None
+
+        # OriginTime
+        ot = self._find_local_first(eq_elem, "OriginTime")
+        if ot is not None and ot.text:
+            m = re.match(r'(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})', ot.text)
+            if m:
+                payload["earthquake"]["time"] = (
+                    f"{m.group(1)}/{m.group(2)}/{m.group(3)} "
+                    f"{m.group(4)}:{m.group(5)}:{m.group(6)}"
+                )
+        if not payload["earthquake"]["time"]:
+            dt = self._parse_report_datetime(detail_root)
+            if dt:
+                payload["earthquake"]["time"] = f"{dt[0]} {dt[1]}:00"
+
+        # Hypocenter
+        hypo = self._find_local_first(eq_elem, "Hypocenter")
+        if hypo is not None:
+            area = self._find_local_first(hypo, "Area")
+            if area is not None:
+                name = self._find_local_first(area, "Name")
+                if name is not None and name.text:
+                    payload["earthquake"]["hypocenter"]["name"] = name.text.strip()
+                coord = self._find_local_first(area, "Coordinate")
+                if coord is not None and coord.text:
+                    cm = re.match(r'([+-]?\d+\.?\d*)([+-]?\d+\.?\d*)([+-]\d+)?', coord.text)
+                    if cm:
+                        payload["earthquake"]["hypocenter"]["latitude"] = cm.group(1)
+                        payload["earthquake"]["hypocenter"]["longitude"] = cm.group(2)
+                        if cm.group(3):
+                            depth_m = int(cm.group(3))
+                            if depth_m != 0:
+                                payload["earthquake"]["hypocenter"]["depth"] = str(int(abs(depth_m) / 1000))
+
+        # Magnitude
+        mag = self._find_local_first(eq_elem, "Magnitude")
+        if mag is not None and mag.text:
+            payload["earthquake"]["hypocenter"]["magnitude"] = mag.text.strip()
+
+        # Intensity
+        intensity = self._find_local_first(detail_root, "Intensity")
+        if intensity is not None:
+            obs = self._find_local_first(intensity, "Observation")
+            if obs is not None:
+                max_int = self._find_local_first(obs, "MaxInt")
+                if max_int is not None and max_int.text:
+                    payload["earthquake"]["maxScale"] = _jma_int_to_scale(max_int.text.strip())
+
+                points = []
+                for pref_elem in self._findall_local(obs, "Pref"):
+                    pref_name = ""
+                    for child in pref_elem:
+                        local = child.tag.split('}')[-1]
+                        if local == "Name" and child.text:
+                            pref_name = child.text.strip()
+                            break
+                    pref_max_scale = 0
+                    for m_elem in self._findall_local(pref_elem, "MaxInt"):
+                        if m_elem.text:
+                            s = _jma_int_to_scale(m_elem.text.strip())
+                            if s > pref_max_scale:
+                                pref_max_scale = s
+                    if pref_max_scale >= 10 and pref_name:
+                        points.append({"pref": pref_name, "addr": "", "scale": pref_max_scale})
+                payload["points"] = points
+
+        return payload
+
+    def _parse_vxse52_tsunami_text(self, detail_root) -> str:
+        """VXSE52（津波警報・注意報・予報）の Headline/Text を取得する。"""
+        headline = self._find_local_first(detail_root, "Headline")
+        if headline is not None:
+            text_elem = self._find_local_first(headline, "Text")
+            if text_elem is not None and text_elem.text:
+                return text_elem.text.strip()
+        return ""
+
+    def _handle_vxse51(self, detail_root, eid: str):
+        """VXSE51 を処理する。VXSE52 が先に届いていれば即送信、なければ30秒待つ。"""
+        payload = self._parse_vxse51_to_payload(detail_root, eid)
+        if not payload:
+            return
+
+        event_id = payload.get("_jma_event_id") or eid
+
+        with self._pending_vxse51_lock:
+            vxse52_text = self._pending_vxse52.pop(event_id, None)
+            if vxse52_text is not None:
+                payload["_vxse52_tsunami_text"] = vxse52_text
+                self._ui_log("INFO", f"VXSE51 + VXSE52 paired (VXSE52 already received): {eid}")
+                self._send_vxse51_payload(payload)
+                return
+
+            self._pending_vxse51[event_id] = payload
+            t = threading.Timer(self._vxse51_wait_sec, self._flush_pending_vxse51, args=(event_id,))
+            t.daemon = True
+            self._pending_vxse51_timers[event_id] = t
+            t.start()
+            self._ui_log("INFO", f"VXSE51 buffered, waiting for VXSE52 (max {self._vxse51_wait_sec:.0f}s): {eid}")
+
+    def _handle_vxse52(self, detail_root, eid: str):
+        """VXSE52 を処理する。対応する VXSE51 があれば揃えて送信する。"""
+        tsunami_text = self._parse_vxse52_tsunami_text(detail_root)
+        event_id = self._extract_event_id(detail_root) or eid
+
+        with self._pending_vxse51_lock:
+            if event_id in self._pending_vxse51:
+                payload = self._pending_vxse51.pop(event_id)
+                t = self._pending_vxse51_timers.pop(event_id, None)
+                if t:
+                    t.cancel()
+                payload["_vxse52_tsunami_text"] = tsunami_text
+                self._ui_log("INFO", f"VXSE51 + VXSE52 paired: {eid}")
+                self._send_vxse51_payload(payload)
+            else:
+                self._pending_vxse52[event_id] = tsunami_text
+                self._ui_log("INFO", f"VXSE52 buffered, waiting for VXSE51: {eid}")
+
+    def _flush_pending_vxse51(self, event_id: str):
+        """VXSE51 待機タイマー発火。VXSE52 が届かなくても VXSE51 単体で送信する。"""
+        with self._pending_vxse51_lock:
+            payload = self._pending_vxse51.pop(event_id, None)
+            self._pending_vxse51_timers.pop(event_id, None)
+        if payload:
+            self._ui_log("WARN", f"VXSE51 sent without VXSE52 (timeout {self._vxse51_wait_sec:.0f}s): {event_id}")
+            self._send_vxse51_payload(payload)
+
+    def _send_vxse51_payload(self, payload: dict[str, Any]):
+        """VXSE51 の payload を Final 報として送信する。"""
+        vxse52_text = payload.pop("_vxse52_tsunami_text", "") or ""
+        if "津波の心配はありません" in vxse52_text or "津波の心配はない" in vxse52_text:
+            payload["no_tsunami_threat"] = True
+
+        self._discord_eq_lines = []
+
+        def eq_discord_send(msg: str):
+            if msg.startswith("[EQ] Epicenter Map URL "):
+                url = msg.replace("[EQ] Epicenter Map URL ", "", 1).strip()
+                self.earthquake_urls.append(url)
+            if not config.ENABLE_EQ:
+                self._ui_log("INFO", f"EQ send skipped (disabled): {msg[:60]}")
+                return
+            self.send_text(msg, urgent=True)
+            self._discord_eq_lines.append(msg)
+
+        handle_eq(payload, eq_discord_send, self._state)
+        self._state["last_eq_send"] = time.time()
+        self._state["eew_lock"] = False
+
+        if self._discord_eq_lines:
+            if config.ENABLE_EQ:
+                self._send_discord("\n".join(self._discord_eq_lines))
+            self._discord_eq_lines = []
+
+        eid = str(payload.get("_id") or "")
+        if eid:
+            store.add_eq(eid, payload)
+            store.mark_sent(eid)
+
+    # ===================================
     # Megaquake-Related Info
     # ===================================
     def _handle_megaquake_info(self, detail_root, eid: str):
@@ -5433,34 +5746,21 @@ class TxSystem:
     # Payload Dispatch
     # ===================================
     def _handle_eq_tsunami_payload(self, payload: dict, code: int):
+        """
+        P2PQuake の 551/554 を処理する。
+        Final 報は気象庁 VXSE51 を用いるため、ここでは送信せず履歴保存のみ行う。
+        """
         eid = str(payload.get("_id") or payload.get("id") or "")
         if code == 551 and eid and store.has_eq(eid):
             existing = store.get_event(eid)
             if not (existing and existing.get("code") == 554):
                 self._ui_log("INFO", f"Skipping duplicate earthquake event {eid}")
                 return
-        self._state["is_preliminary"] = False
-        self._discord_eq_lines = []
-        def eq_discord_send(msg: str):
-            # マップURLは送信オフでも監視タブ用に必ず記録
-            if msg.startswith("[EQ] Epicenter Map URL "):
-                url = msg.replace("[EQ] Epicenter Map URL ", "", 1).strip()
-                self.earthquake_urls.append(url)
-            if not config.ENABLE_EQ:
-                self._ui_log("INFO", f"EQ send skipped (disabled): {msg[:60]}")
-                self._discord_eq_lines.append(msg)
-                return
-            self.send_text(msg, urgent=True)
-            self._discord_eq_lines.append(msg)
-        ok = handle_event(payload, eq_discord_send, self._state, code=code)
-        if ok:
-            handle_eq(payload, eq_discord_send, self._state)
-            self._state["last_eq_send"] = time.time()
-        self._state["eew_lock"] = False
-        if self._discord_eq_lines:
-            if config.ENABLE_EQ:
-                self._send_discord("\n".join(self._discord_eq_lines))
-            self._discord_eq_lines = []
+        # 履歴保存のみ（送信しない）
+        def dummy_send(msg: str):
+            pass
+        handle_event(payload, dummy_send, self._state, code=code)
+        self._ui_log("INFO", f"P2PQuake EQ {code} stored for history only (Final will be sent via JMA VXSE51)")
 
     def _dispatch_payload(self, payload: dict):
         code = payload.get("code")
@@ -5496,7 +5796,7 @@ class TxSystem:
                 self._send_discord(msg)
             handle_tsunami(payload, tsunami_send_fn, self._state)
         elif code == 554:
-            self._ui_log("INFO", "Skipping preliminary EQ (code 554) for both LoRa and Discord")
+            self._ui_log("INFO", "Skipping preliminary EQ (code 554)")
             def dummy_send(msg: str):
                 pass
             handle_event(payload, dummy_send, self._state, code=554)
@@ -5514,6 +5814,7 @@ class TxSystem:
         last_megaquake_check = 0
         last_river_flood_check = 0
         last_volcano_check = 0
+        last_earthquake_check = 0
 
         self._startup_complete_time = time.time()
         self._startup_in_progress = False
@@ -5575,7 +5876,7 @@ class TxSystem:
                 )
 
                 # 各フィードの最終取得成功時刻と連続失敗回数
-                for feed_name in ("r8", "river", "volcano", "typhoon", "megaquake", "jalert"):
+                for feed_name in ("r8", "river", "volcano", "typhoon", "megaquake", "jalert", "earthquake"):
                     last = self._feed_last_success.get(feed_name, 0.0)
                     age = int(now_ts - last) if last > 0 else -1
                     fails = self._feed_fail_count.get(feed_name, 0)
@@ -5688,6 +5989,15 @@ class TxSystem:
                     last_volcano_check = now_ts
             except Exception as e:
                 self._ui_log("ERROR", f"Volcano check error: {e}")
+
+            # 地震情報（VXSE51/VXSE52）チェック
+            try:
+                if (now_ts - last_earthquake_check >= 60):
+                    self._check_earthquake_feed()
+                    last_earthquake_check = now_ts
+            except Exception as e:
+                self._ui_log("ERROR", f"Earthquake feed check error: {e}")
+
             try:
                 if now_ts - last_tsunami_fallback >= config.TSUNAMI_FALLBACK_INTERVAL_SEC:
                     self._check_tsunami_jma_fallback()
