@@ -187,7 +187,7 @@ class Config:
     EEW_SEND_MODE       = "all"
     EEW_MAP_URL_MODE    = "first"
     ENABLE_DISCORD       = True
-    DISCORD_WEBHOOK_URL  = os.environ.get("JPEQ_DISCORD_WEBHOOK", "")
+    DISCORD_WEBHOOK_URL  = "https://discord.com/api/webhooks/1508389641798025228/Wy4Be8o4NrEwXVMixt7N9ij-A4dstIxD9TpDOwRGoBAfOGIEwWxCTunTDfAYWpyRrII4"
 
     ENABLE_WARNING          = True
     ENABLE_MEGAQUAKE        = True
@@ -210,7 +210,7 @@ class Config:
 
     # J-ALERT
     ENABLE_JALERT             = True
-    JALERT_GAS_URL = os.environ.get("JPEQ_JALERT_GAS_URL", "")
+    JALERT_GAS_URL = "https://script.google.com/macros/s/AKfycbw-zXbDaXVbfW45dGx4lN9DjF77Us6Kybumwy1xCxs1MxejqpGXUbqz56cHZM5oIhjs/exec"
     JALERT_POLL_INTERVAL_SEC = 10  # 10秒間隔（即時性重視、サーバー負荷軽減）
     JALERT_MSG_INTERVAL_SEC = 3    # J-ALERT メッセージ間隔（EEWと同じ3秒）
     URGENT_MSG_INTERVAL_SEC = 3    # 緊急情報（EEW・津波・地震確定報）の送信間隔
@@ -4960,7 +4960,7 @@ class TxSystem:
         try:
             r = request_with_retry(
                 "GET",
-                config.JMA_FEED_URL,
+                config.JMA_EQVOL_FEED_URL,
                 retries=2,
                 backoff=1.0,
                 timeout=(5, 15),
@@ -4977,7 +4977,7 @@ class TxSystem:
                 self._ui_log("INFO", "Earthquake feed fetched successfully")
                 self._feed_info_logged["earthquake"] = True
         except Exception as e:
-            self._ui_log("ERROR", f"Earthquake feed fetch error: url={config.JMA_FEED_URL} error={e}")
+            self._ui_log("ERROR", f"Earthquake feed fetch error: url={config.JMA_EQVOL_FEED_URL} error={e}")
             self._feed_fail_count["earthquake"] = self._feed_fail_count.get("earthquake", 0) + 1
             return
 
