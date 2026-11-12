@@ -1,0 +1,6 @@
+@echo off
+chcp 65001 >nul
+echo JPEQ を再起動しています...
+ssh <user>@<linux-host> "systemctl --user restart jpeq.service && sleep 2 && systemctl --user status jpeq.service --no-pager | head -15"
+echo.
+pause

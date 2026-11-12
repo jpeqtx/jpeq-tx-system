@@ -187,7 +187,7 @@ class Config:
     EEW_SEND_MODE       = "all"
     EEW_MAP_URL_MODE    = "first"
     ENABLE_DISCORD       = True
-    DISCORD_WEBHOOK_URL  = "https://discord.com/api/webhooks/1508389641798025228/Wy4Be8o4NrEwXVMixt7N9ij-A4dstIxD9TpDOwRGoBAfOGIEwWxCTunTDfAYWpyRrII4"
+    DISCORD_WEBHOOK_URL  = ""
 
     ENABLE_WARNING          = True
     ENABLE_MEGAQUAKE        = True
@@ -916,6 +916,27 @@ class VolcanoLogFilter(logging.Filter):
     def filter(self, record):
         msg = record.getMessage()
         return "[VOLCANO" in msg or "[[VOLCANO" in msg
+
+
+class ExactLevelFilter(logging.Filter):
+    """指定されたレベルのログだけを通過させる。"""
+    def __init__(self, level: int):
+        super().__init__()
+        self._target_level = level
+
+    def filter(self, record):
+        return record.levelno == self._target_level
+
+
+class MinLevelFilter(logging.Filter):
+    """指定されたレベル以上のログを通過させる。"""
+    def __init__(self, level: int):
+        super().__init__()
+        self._target_level = level
+
+    def filter(self, record):
+        return record.levelno >= self._target_level
+
 
 class SizeRotatingFileHandler(logging.FileHandler):
     def __init__(self, base_path: Path, max_bytes: int, encoding="utf-8", delay=False):
@@ -1971,7 +1992,7 @@ def handle_eq(payload: dict[str, Any], send_fn: Callable[[str], None], state: di
         if not passes_eq_filter(max_scale, hypo, points): return
         eew_tag = _eew_tag(state)
         time_str = _parse_time(eq.get("time", ""))
-        epi = epicenter_en(hypo.get("name", "")) or "Unknown"
+        epi = epicenter_en(hypo.get("name", "")) or "Undetermined"
 
         # 不完全な情報（M・座標・深さのいずれか欠落）は暫定値扱い
         mag_val = hypo.get("magnitude")
@@ -2083,16 +2104,17 @@ def handle_eq(payload: dict[str, Any], send_fn: Callable[[str], None], state: di
             addr = max_pt.get("addr", ""); pref = max_pt.get("pref", "")
             if addr: tail = town_to_romaji(addr, pref)
             elif pref: tail = pref_en(pref)
-            else: tail = "Unknown"
+            else: tail = "Undetermined"
             max_scale_label = config.scale_to_label(max_pt.get("scale", 0) or 0)
             send_fn(f"[{eq_prefix}] Max:{tail} I:{max_scale_label}{eew_tag}")
         felt = _build_felt_area(points)
         if felt: send_fn(f"[{eq_prefix}] FELT AREA: {felt}{eew_tag}")
 
         eid = str(payload.get("_id") or payload.get("id") or "")
-        # 津波の有無は気象庁 VXSE52 で確定する。
-        # VXSE52 が「津波の心配はありません」と明示した場合のみ送信する。
-        if eid and payload.get("no_tsunami_threat"):
+        # 津波の有無は P2PQuake の domesticTsunami で判定する。
+        # 確定報（FINAL）かつ「None」（津波の心配なし）の場合のみ送信する。
+        domestic_tsunami = eq.get("domesticTsunami", "")
+        if eid and header_tag == " [FINAL]" and domestic_tsunami == "None":
             send_fn(f"[{eq_prefix}] NO TSUNAMI THREAT")
 
         if eid:
@@ -3738,7 +3760,7 @@ class TxSystem:
                 tag = f"<N/C LEVEL {new_level} {self._volcano_level_label(new_level)}>"
             elif condition == "切替":
                 old_warning_type_jp = state.get("old_warning_type_jp", "")
-                old_warning_type_en = self._translate_volcano_warning_type(old_warning_type_jp) if old_warning_type_jp else "Unknown"
+                old_warning_type_en = self._translate_volcano_warning_type(old_warning_type_jp) if old_warning_type_jp else "Undetermined"
                 tag = f"<SWITCH {old_warning_type_en}->{warning_type_en}>"
             else:
                 tag = f"<LEVEL {new_level} {self._volcano_level_label(new_level)}>"
@@ -5307,7 +5329,22 @@ class TxSystem:
         if self.log_callback:
             try: self.log_callback(level, message)
             except Exception: pass
-        log.info("[%s] %s", level, message)
+        # ログハンドラ初期化前（__init__ から start() の途中）はバッファに貯め、
+        # start() 完了後にまとめて出力する。これにより起動直後のログもファイルに残る。
+        if not TxSystem._log_initialized:
+            if not hasattr(self, "_pending_logs"):
+                self._pending_logs = []
+            self._pending_logs.append((level, message))
+            return
+        # レベルに応じた Python ログレベルで出力する（jpeq_tx_*.log のレベル精度を上げる）
+        if level == "ERROR":
+            log.error("[%s] %s", level, message)
+        elif level == "WARN":
+            log.warning("[%s] %s", level, message)
+        elif level == "DEBUG":
+            log.debug("[%s] %s", level, message)
+        else:
+            log.info("[%s] %s", level, message)
 
     @staticmethod
     def _categorize_text(text: str) -> str:
@@ -5350,6 +5387,13 @@ class TxSystem:
             self.lora_iface = meshtastic.serial_interface.SerialInterface(devPath=config.SERIAL_PORT)
             self._ui_log("INFO", f"LoRa serial opened: {config.SERIAL_PORT}")
 
+            try:
+                if getattr(self.lora_iface, "stream", None) is not None:
+                    self.lora_iface.stream.write_timeout = 5.0
+                    self._ui_log("INFO", "LoRa stream write_timeout set to 5.0s")
+            except Exception as e:
+                self._ui_log("WARN", f"Failed to set LoRa serial write_timeout: {e}")
+
             # 接続デバイスから自ノード番号を取得し、Configへ反映する
             node_info = self.lora_iface.getMyNodeInfo()
             node_num = node_info.get("num") if node_info else None
@@ -5362,6 +5406,55 @@ class TxSystem:
                 self.lora_iface = None
         except Exception as e:
             self._ui_log("ERROR", f"LoRa init failed: {e}")
+            self.lora_iface = None
+
+    def _check_lora_watchdog(self):
+        if not config.USE_LORA or self.lora_iface is None:
+            return
+        now_ts = time.time()
+        with self._tx_counters_lock:
+            current_tx_total = sum(self._tx_counters.values())
+        if current_tx_total != getattr(self, "_lora_watchdog_last_tx_total", -1):
+            self._lora_watchdog_last_tx_total = current_tx_total
+            self._lora_watchdog_last_change_ts = now_ts
+        stalled_sec = now_ts - getattr(self, "_lora_watchdog_last_change_ts", now_ts)
+        queue_nonempty = not self._send_queue.empty()
+        thread_count = threading.active_count()
+        should_reinit = False
+        reason = ""
+        if queue_nonempty and stalled_sec >= 120:
+            should_reinit = True
+            reason = f"tx_total stagnant for {int(stalled_sec)}s with non-empty queue"
+        elif thread_count >= 100:
+            should_reinit = True
+            reason = f"thread count {thread_count} exceeded threshold"
+        if not should_reinit:
+            return
+        window_start = getattr(self, "_lora_watchdog_reinit_window_start", 0)
+        if now_ts - window_start >= 600:
+            self._lora_watchdog_reinit_window_start = now_ts
+            self._lora_watchdog_reinit_count = 0
+        if getattr(self, "_lora_watchdog_reinit_count", 0) >= 2:
+            self._ui_log("ERROR", f"LoRa watchdog: reinit suppressed (already 2 times in 10 min). reason={reason}")
+            return
+        self._ui_log("WARN", f"LoRa watchdog triggered: {reason}. Reinitializing SerialInterface...")
+        self._lora_watchdog_reinit_count = getattr(self, "_lora_watchdog_reinit_count", 0) + 1
+        try:
+            old_iface = self.lora_iface
+            self.lora_iface = None
+            try:
+                old_iface.close()
+            except Exception as e:
+                self._ui_log("WARN", f"LoRa watchdog: old iface close failed: {e}")
+            time.sleep(1.0)
+            self._init_lora()
+            if self.lora_iface is not None:
+                self._ui_log("INFO", "LoRa watchdog: SerialInterface reinitialized successfully")
+                self._lora_watchdog_last_change_ts = time.time()
+            else:
+                self._ui_log("ERROR", "LoRa watchdog: SerialInterface reinit failed")
+        except Exception as e:
+            self._ui_log("ERROR", f"LoRa watchdog reinit error: {e}")
             self.lora_iface = None
 
     # ===================================
@@ -5746,21 +5839,33 @@ class TxSystem:
     # Payload Dispatch
     # ===================================
     def _handle_eq_tsunami_payload(self, payload: dict, code: int):
-        """
-        P2PQuake の 551/554 を処理する。
-        Final 報は気象庁 VXSE51 を用いるため、ここでは送信せず履歴保存のみ行う。
-        """
         eid = str(payload.get("_id") or payload.get("id") or "")
         if code == 551 and eid and store.has_eq(eid):
             existing = store.get_event(eid)
             if not (existing and existing.get("code") == 554):
                 self._ui_log("INFO", f"Skipping duplicate earthquake event {eid}")
                 return
-        # 履歴保存のみ（送信しない）
-        def dummy_send(msg: str):
-            pass
-        handle_event(payload, dummy_send, self._state, code=code)
-        self._ui_log("INFO", f"P2PQuake EQ {code} stored for history only (Final will be sent via JMA VXSE51)")
+        self._state["is_preliminary"] = False
+        self._discord_eq_lines = []
+        def eq_discord_send(msg: str):
+            if msg.startswith("[EQ] Epicenter Map URL "):
+                url = msg.replace("[EQ] Epicenter Map URL ", "", 1).strip()
+                self.earthquake_urls.append(url)
+            if not config.ENABLE_EQ:
+                self._ui_log("INFO", f"EQ send skipped (disabled): {msg[:60]}")
+                self._discord_eq_lines.append(msg)
+                return
+            self.send_text(msg, urgent=True)
+            self._discord_eq_lines.append(msg)
+        ok = handle_event(payload, eq_discord_send, self._state, code=code)
+        if ok:
+            handle_eq(payload, eq_discord_send, self._state)
+            self._state["last_eq_send"] = time.time()
+        self._state["eew_lock"] = False
+        if self._discord_eq_lines:
+            if config.ENABLE_EQ:
+                self._send_discord("\n".join(self._discord_eq_lines))
+            self._discord_eq_lines = []
 
     def _dispatch_payload(self, payload: dict):
         code = payload.get("code")
@@ -5990,13 +6095,7 @@ class TxSystem:
             except Exception as e:
                 self._ui_log("ERROR", f"Volcano check error: {e}")
 
-            # 地震情報（VXSE51/VXSE52）チェック
-            try:
-                if (now_ts - last_earthquake_check >= 60):
-                    self._check_earthquake_feed()
-                    last_earthquake_check = now_ts
-            except Exception as e:
-                self._ui_log("ERROR", f"Earthquake feed check error: {e}")
+            # 地震情報は P2PQuake (551) を使用するため、気象庁フィードのチェックは行わない
 
             try:
                 if now_ts - last_tsunami_fallback >= config.TSUNAMI_FALLBACK_INTERVAL_SEC:
@@ -6016,6 +6115,13 @@ class TxSystem:
                 self._check_memorial()
             except Exception as e:
                 self._ui_log("ERROR", f"Memorial check error: {e}")
+
+            try:
+                if now_ts - getattr(self, "_lora_watchdog_last_check", 0) >= 60:
+                    self._lora_watchdog_last_check = now_ts
+                    self._check_lora_watchdog()
+            except Exception as e:
+                self._ui_log("ERROR", f"LoRa watchdog error: {e}")
 
     def _jalert_polling_loop(self):
         fail_count = 0
@@ -6071,7 +6177,7 @@ class TxSystem:
                 with memorial_path.open("r", encoding="utf-8") as f:
                     self._memorial_data = json.load(f)
             for d in self._memorial_data:
-                name = d.get("disaster_name", "Unknown")
+                name = d.get("disaster_name", "Undetermined")
                 if name in self._memorial_sent_today: continue
                 dt_str = d.get("date_time", "")
                 m = re.search(r"\d{2,4}-(\d{1,2})-(\d{1,2})\s+(\d{1,2}):(\d{2})", dt_str)
@@ -6174,9 +6280,51 @@ class TxSystem:
             volcano_path = log_dir / f"volcano_{start_ts}.log"
             volcano_fh = SizeRotatingFileHandler(volcano_path, max_bytes=config.LOG_MAX_FILE_SIZE, delay=False)
             volcano_fh.setLevel(logging.DEBUG); volcano_fh.setFormatter(formatter); volcano_fh.addFilter(VolcanoLogFilter()); root_logger.addHandler(volcano_fh); self._log_handlers.append(volcano_fh)
+
+            # レベル別ログファイル（INFO / WARN / ERROR）
+            info_path = log_dir / f"info_{start_ts}.log"
+            info_fh = SizeRotatingFileHandler(info_path, max_bytes=config.LOG_MAX_FILE_SIZE, delay=False)
+            info_fh.setLevel(logging.DEBUG); info_fh.setFormatter(formatter); info_fh.addFilter(ExactLevelFilter(logging.INFO)); root_logger.addHandler(info_fh); self._log_handlers.append(info_fh)
+
+            warn_path = log_dir / f"warn_{start_ts}.log"
+            warn_fh = SizeRotatingFileHandler(warn_path, max_bytes=config.LOG_MAX_FILE_SIZE, delay=False)
+            warn_fh.setLevel(logging.DEBUG); warn_fh.setFormatter(formatter); warn_fh.addFilter(ExactLevelFilter(logging.WARNING)); root_logger.addHandler(warn_fh); self._log_handlers.append(warn_fh)
+
+            error_path = log_dir / f"error_{start_ts}.log"
+            error_fh = SizeRotatingFileHandler(error_path, max_bytes=config.LOG_MAX_FILE_SIZE, delay=False)
+            error_fh.setLevel(logging.DEBUG); error_fh.setFormatter(formatter); error_fh.addFilter(MinLevelFilter(logging.ERROR)); root_logger.addHandler(error_fh); self._log_handlers.append(error_fh)
+
+            # ルートロガーを DEBUG にし、JPEQ 内部の DEBUG ログも jpeq_tx_*.log に捕捉する。
+            # ただし第三者ライブラリの DEBUG ノイズは WARNING 以上のみ通す。
+            root_logger.setLevel(logging.DEBUG)
+            for _noisy in ("urllib3", "requests", "websockets", "paho", "meshtastic"):
+                logging.getLogger(_noisy).setLevel(logging.WARNING)
+
             TxSystem._log_initialized = True
         else:
             self._log_handlers = []
+
+        # start() より前に呼ばれた _ui_log をフラッシュする
+        if hasattr(self, "_pending_logs") and self._pending_logs:
+            for _lvl, _msg in self._pending_logs:
+                if _lvl == "ERROR":
+                    log.error("[%s] %s", _lvl, _msg)
+                elif _lvl == "WARN":
+                    log.warning("[%s] %s", _lvl, _msg)
+                elif _lvl == "DEBUG":
+                    log.debug("[%s] %s", _lvl, _msg)
+                else:
+                    log.info("[%s] %s", _lvl, _msg)
+            self._pending_logs.clear()
+
+        # 起動時点の write_timeout 値を記録する（動作確認用）
+        if config.USE_LORA and self.lora_iface is not None:
+            try:
+                _stream = getattr(self.lora_iface, "stream", None)
+                _wt = getattr(_stream, "write_timeout", None) if _stream is not None else None
+                self._ui_log("INFO", f"LoRa stream.write_timeout = {_wt}")
+            except Exception as e:
+                self._ui_log("WARN", f"Failed to read LoRa stream.write_timeout: {e}")
         threading.Thread(target=self._fetch_history, daemon=True).start()
         if self.mqtt: self.mqtt.start()
         threading.Thread(target=self._jalert_polling_loop, daemon=True, name="jalert").start()
@@ -7555,7 +7703,7 @@ class JPEQApp(tk.Tk):
                     continue
                 hypo = eq.get("hypocenter", {}) or {}
                 t = eq.get("time", "")
-                epi = epicenter_en(hypo.get("name", "")) or hypo.get("name", "Unknown")
+                epi = epicenter_en(hypo.get("name", "")) or hypo.get("name", "Undetermined")
                 mag_raw = hypo.get("magnitude", "-")
                 if not hypo.get("name") or mag_raw in ("", "-", None):
                     continue
@@ -7731,7 +7879,7 @@ class JPEQApp(tk.Tk):
         eq_list = store.list_eq()
         for ev in eq_list[:50]:
             eq = ev.get("earthquake", {}) or {}; hypo = eq.get("hypocenter", {}) or {}
-            t = eq.get("time", ""); epi = epicenter_en(hypo.get("name", "")) or "Unknown"
+            t = eq.get("time", ""); epi = epicenter_en(hypo.get("name", "")) or "Undetermined"
             mag_raw = hypo.get("magnitude", "-"); mag = "-"
             if mag_raw is not None and mag_raw not in ("", "-"):
                 try:

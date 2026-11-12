@@ -1,0 +1,23 @@
+# 実設定（秘密情報を含むため公開しない）
+data/config.json
+
+# 実行時に生成・更新される状態ファイル
+data/eq_history.json
+data/tsunami_history.json
+data/typhoon_state.json
+data/volcano_state.json
+data/river_flood_state.json
+data/unsent_final_queue.json
+data/last_warnings.json
+data/weather_state_json.json
+data/weather_state_v2.json
+data/jpeq_tx_wx_db.json
+data/unknown_warning_kinds.json
+data/jpeq_tx_wx_db.py
+
+# ログと実行環境
+logs/
+.venv/
+__pycache__/
+*.log
+*.lock
